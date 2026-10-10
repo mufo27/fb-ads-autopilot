@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     FRONTEND_ORIGIN: str = "http://localhost:3000"  # CORS ล็อกไว้แค่นี้ (ห้าม *)
     SYSTEM_MAX_DAILY_CAP: float = 5000  # เพดานสูงสุดของ daily_hard_cap (ขยายเองเกินนี้ไม่ได้)
 
+    # ---- User auth / OAuth ----
+    AUTH_SECRET: str = ""         # ลายเซ็น session token (ว่าง = ใช้ SECURITY_KEY แทน)
+    REDIRECT_BASE: str = "http://localhost:8000"  # base URL ของ backend สำหรับ OAuth callback
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    FACEBOOK_CLIENT_ID: str = ""
+    FACEBOOK_CLIENT_SECRET: str = ""
+
     @property
     def graph_base(self) -> str:
         return "https://graph.facebook.com/v21.0"

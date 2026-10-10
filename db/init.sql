@@ -77,3 +77,15 @@ INSERT INTO guardrail_config
      min_roas, learning_min_conv, dry_run)
 VALUES (1000, 400, 120, 30, 1.5, 50, TRUE)
 ON CONFLICT DO NOTHING;
+
+-- ผู้ใช้ (login / register)
+CREATE TABLE IF NOT EXISTS users (
+    id              BIGSERIAL PRIMARY KEY,
+    email           TEXT UNIQUE,
+    name            TEXT,
+    password_hash   TEXT,
+    provider        TEXT DEFAULT 'password',   -- password | google | facebook
+    provider_id     TEXT,
+    role            TEXT DEFAULT 'user',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

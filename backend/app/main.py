@@ -3,10 +3,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, Depends, Header, HTTPException, Request
+from fastapi import FastAPI, Depends, Header, HTTPException, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
-from . import db, guardrails, meta_client, ai_engine, credentials, security, ratelimit, sync
+from . import db, guardrails, meta_client, ai_engine, credentials, security, ratelimit, sync, auth
 from .config import get_settings
 
 s = get_settings()
@@ -31,18 +32,22 @@ def rl(limit: int, window_s: int, scope: str):
 
 
 def require_admin(request: Request, x_admin_token: Optional[str] = Header(None),
-                  authorization: Optional[str] = Header(None)):
-    """S2 fail-closed: ไม่มี admin ตั้งไว้ = ล็อกทุก endpoint / token ไม่ตรง = 403 (+ กัน brute-force)"""
+                  authorization: Optional[str] = Header(None),
+                  session: Optional[str] = Cookie(None)):
+    """gate: ยอมรับ (1) session cookie จาก login หรือ (2) ADMIN_TOKEN (owner/API) — ไม่งั้น 401 fail-closed"""
     token = x_admin_token or (authorization[7:] if authorization and authorization.startswith("Bearer ") else None)
     # กันเดาสุ่ม: สูงสุด 300 ครั้ง/นาที ต่อ ip+token
     ok, retry = ratelimit.allow(f"auth:{_ident(request, token)}", 300, 60)
     if not ok:
         raise HTTPException(429, f"พยายามบ่อยเกินไป ลองใหม่ใน {retry}s", headers={"Retry-After": str(retry)})
-    if not security.auth_enabled():
-        raise HTTPException(403, "ยังไม่ตั้งค่า ADMIN_TOKEN/ADMIN_TOKEN_HASH — ระบบล็อกไว้ (fail-closed)")
-    if not security.verify_admin_token(token or ""):
-        raise HTTPException(403, "ยืนยันตัวตนไม่ผ่าน")
-    return True
+    # 1) session cookie
+    user = auth.read_session(session)
+    if user:
+        return user
+    # 2) admin token (owner / สคริปต์)
+    if security.auth_enabled() and security.verify_admin_token(token or ""):
+        return {"role": "owner", "email": "owner"}
+    raise HTTPException(401, "ต้องเข้าสู่ระบบ")
 
 
 def sync_guardrails_from_env():
@@ -90,6 +95,7 @@ def _save_kill_state(flag: bool):
 async def lifespan(app: FastAPI):
     try:
         credentials.ensure_table()
+        auth.ensure_users_table()
         credentials.apply_to_settings()   # ดึง key ที่ผู้ใช้เคยใส่ (จาก DB) ขึ้นมาใช้ก่อน env
         _load_kill_state()
         sync_guardrails_from_env()
@@ -117,6 +123,117 @@ app.add_middleware(
 @app.get("/api/health")
 def health():
     return {"ok": True, "dry_run": guardrails.get_config()["dry_run"], "keys": s.keys_provided()}
+
+
+# ---- Auth (login / register / OAuth) -----------------------------------------
+def _set_session(resp: Response, user: dict):
+    resp.set_cookie(auth.COOKIE, auth.create_session(user), httponly=True, samesite="lax",
+                    secure=False, max_age=auth.SESSION_TTL, path="/")
+
+
+def _public_user(u: dict) -> dict:
+    return {"id": u["id"], "email": u.get("email"), "name": u.get("name"),
+            "role": u.get("role", "user"), "provider": u.get("provider", "password")}
+
+
+@app.post("/api/auth/register")
+def auth_register(body: dict, resp: Response):
+    email = (body.get("email") or "").strip()
+    name = (body.get("name") or "").strip()
+    pw = body.get("password") or ""
+    if not email or "@" not in email:
+        raise HTTPException(400, "อีเมลไม่ถูกต้อง")
+    if len(pw) < 8:
+        raise HTTPException(400, "รหัสผ่านอย่างน้อย 8 ตัวอักษร")
+    try:
+        u = auth.register_password(email, name or email.split("@")[0], pw)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    _set_session(resp, u)
+    return {"ok": True, "user": _public_user(u)}
+
+
+@app.post("/api/auth/login")
+def auth_login(body: dict, resp: Response):
+    u = auth.login_password((body.get("email") or "").strip(), body.get("password") or "")
+    if not u:
+        raise HTTPException(401, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
+    _set_session(resp, u)
+    return {"ok": True, "user": _public_user(u)}
+
+
+@app.get("/api/auth/me")
+def auth_me(session: Optional[str] = Cookie(None)):
+    p = auth.read_session(session)
+    if not p:
+        raise HTTPException(401, "ไม่ได้เข้าสู่ระบบ")
+    u = auth.get_by_id(p["uid"]) or {"id": p["uid"], "email": p.get("email"), "name": p.get("name"), "role": p.get("role", "user")}
+    return {"user": _public_user(u)}
+
+
+@app.post("/api/auth/profile")
+def auth_update_profile(body: dict, session: Optional[str] = Cookie(None)):
+    p = auth.read_session(session)
+    if not p:
+        raise HTTPException(401, "ไม่ได้เข้าสู่ระบบ")
+    try:
+        auth.update_name(p["uid"], body.get("name", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "user": _public_user(auth.get_by_id(p["uid"]))}
+
+
+@app.post("/api/auth/change-password")
+def auth_change_pw(body: dict, session: Optional[str] = Cookie(None),
+                   _: bool = Depends(rl(5, 60, "chpw"))):
+    p = auth.read_session(session)
+    if not p:
+        raise HTTPException(401, "ไม่ได้เข้าสู่ระบบ")
+    try:
+        auth.change_password(p["uid"], body.get("old_password", ""), body.get("new_password", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(resp: Response):
+    resp.delete_cookie(auth.COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/oauth-providers")
+def auth_providers():
+    return {"google": auth.oauth_configured("google"), "facebook": auth.oauth_configured("facebook")}
+
+
+@app.get("/api/auth/{provider}/start")
+def auth_start(provider: str):
+    if provider not in ("google", "facebook"):
+        raise HTTPException(404, "unknown provider")
+    if not auth.oauth_configured(provider):
+        raise HTTPException(400, f"ยังไม่ได้ตั้งค่า {provider} OAuth (ใส่ client id/secret ใน env)")
+    state = auth.new_state()
+    r = RedirectResponse(auth.authorize_url(provider, state))
+    r.set_cookie("oauth_state", state, httponly=True, samesite="lax", max_age=600, path="/")
+    return r
+
+
+@app.get("/api/auth/{provider}/callback")
+async def auth_callback(provider: str, code: str = "", state: str = "", oauth_state: Optional[str] = Cookie(None)):
+    if provider not in ("google", "facebook") or not code:
+        raise HTTPException(400, "คำขอ OAuth ไม่ถูกต้อง")
+    if not state or state != oauth_state:
+        raise HTTPException(400, "state ไม่ตรง (กัน CSRF)")
+    try:
+        prof = await (auth.exchange_google(code) if provider == "google" else auth.exchange_facebook(code))
+        u = auth.upsert_oauth(provider, prof["pid"], prof.get("email"), prof.get("name"))
+    except Exception as e:  # noqa
+        raise HTTPException(502, f"OAuth ล้มเหลว: {e}")
+    r = RedirectResponse(f"{s.FRONTEND_ORIGIN}?authed=1")
+    _set_session(r, u)
+    r.delete_cookie("oauth_state", path="/")
+    return r
 
 
 @app.post("/api/connect/validate")
